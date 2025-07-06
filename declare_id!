@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: MIT
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Token, TokenAccount, Mint};
+
+declare_id!("11111111111111111111111111111111");
+
+#[program]
+pub mod droc {
+    use super::*;
+    
+    pub fn create_order(
+        ctx: Context<CreateOrder>,
+        price: u64,
+        quantity: u64,
+        expiry: i64,
+        order_type: OrderType,
+    ) -> Result<()> {
+        let order = &mut ctx.accounts.order;
+        order.maker = *ctx.accounts.maker.key;
+        order.collateral = ctx.accounts.collateral_account.amount;
+        order.price = price;
+        order.quantity = quantity;
+        order.expiry = expiry;
+        order.market = ctx.accounts.market.key();
+        order.order_type = order_type;
+        order.filled = false;
+        order.bump = ctx.bumps.order;
+        
+        Ok(())
+    }
+    
+    pub fn cancel_order(ctx: Context<CancelOrder>) -> Result<()> {
+        let order = &mut ctx.accounts.order;
+        require!(!order.filled, DrocError::OrderAlreadyFilled);
+        
+        // Return collateral to maker
+        let cpi_accounts = token::Transfer {
+            from: ctx.accounts.collateral_account.to_account_info(),
+            to: ctx.accounts.maker_token_account.to_account_info(),
+            authority: ctx.accounts.order.to_account_info(),
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        token::transfer(cpi_ctx, order.collateral)?;
+        
+        Ok(())
+    }
+    
+    pub fn initialize_vault(ctx: Context<InitializeVault>) -> Result<()> {
+        let vault = &mut ctx.accounts.vault;
+        vault.total_collateral = 0;
+        vault.active_orders = 0;
+        vault.jito_rewards_collected = 0;
+        vault.authority = *ctx.accounts.authority.key;
+        vault.bump = ctx.bumps.vault;
+        
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+#[instruction(price: u64, quantity: u64, expiry: i64, order_type: OrderType)]
+pub struct CreateOrder<'info> {
+    #[account(
+        init,
+        payer = maker,
+        space = 8 + std::mem::size_of::<DROCOrder>(),
+        seeds = [b"order", maker.key().as_ref()],
+        bump
+    )]
+    pub order: Account<'info, DROCOrder>,
+    
+    #[account(mut)]
+    pub maker: Signer<'info>,
+    
+    #[account(
+        mut,
+        constraint = collateral_account.owner == maker.key() @ DrocError::InvalidCollateralOwner
+    )]
+    pub collateral_account: Account<'info, TokenAccount>,
+    
+    /// CHECK: Market account validation handled by business logic
+    pub market: AccountInfo<'info>,
+    
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CancelOrder<'info> {
+    #[account(
+        mut,
+        has_one = maker,
+        seeds = [b"order", maker.key().as_ref()],
+        bump = order.bump
+    )]
+    pub order: Account<'info, DROCOrder>,
+    
+    pub maker: Signer<'info>,
+    
+    #[account(mut)]
+    pub collateral_account: Account<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        constraint = maker_token_account.owner == maker.key() @ DrocError::InvalidTokenAccountOwner
+    )]
+    pub maker_token_account: Account<'info, TokenAccount>,
+    
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct InitializeVault<'info> {
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + std::mem::size_of::<RestingLiquidityVault>(),
+        seeds = [b"vault"],
+        bump
+    )]
+    pub vault: Account<'info, RestingLiquidityVault>,
+    
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    
+    pub system_program: Program<'info, System>,
+}
+
+#[account]
+pub struct DROCOrder {
+    pub maker: Pubkey,          // 32 bytes
+    pub collateral: u64,        // 8 bytes
+    pub price: u64,             // 8 bytes
+    pub quantity: u64,          // 8 bytes
+    pub expiry: i64,            // 8 bytes
+    pub market: Pubkey,         // 32 bytes
+    pub order_type: OrderType,  // 1 byte
+    pub filled: bool,           // 1 byte
+    pub bump: u8,               // 1 byte
+}
+
+#[account]
+pub struct RestingLiquidityVault {
+    pub total_collateral: u64,      // 8 bytes
+    pub active_orders: u64,         // 8 bytes
+    pub jito_rewards_collected: u64, // 8 bytes
+    pub authority: Pubkey,          // 32 bytes
+    pub bump: u8,                   // 1 byte
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
+pub enum OrderType {
+    Buy,
+    Sell,
+}
+
+#[error_code]
+pub enum DrocError {
+    #[msg("Order already filled.")]
+    OrderAlreadyFilled,
+    #[msg("Invalid collateral account owner.")]
+    InvalidCollateralOwner,
+    #[msg("Invalid token account owner.")]
+    InvalidTokenAccountOwner,
+}
